@@ -778,6 +778,7 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 			}
 
 		case OpcodeDispatch:
+			becameReady := false
 			// set last sequence received
 			g.sessionMu.Lock()
 			g.config.LastSequenceReceived = &message.S
@@ -798,13 +799,13 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 				g.statusMu.Lock()
 				g.status = StatusReady
 				g.statusMu.Unlock()
-				ready(nil)
+				becameReady = true
 			} else if _, ok = eventData.(EventResumed); ok {
 				g.config.Logger.Debug("successfully resumed")
 				g.statusMu.Lock()
 				g.status = StatusReady
 				g.statusMu.Unlock()
-				ready(nil)
+				becameReady = true
 			}
 
 			// push message to the command manager
@@ -820,6 +821,9 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 				continue
 			}
 			g.eventHandlerFunc(g, message.T, message.S, eventData)
+			if becameReady {
+				ready(nil)
+			}
 
 		case OpcodeHeartbeat:
 			g.sendHeartbeat()
