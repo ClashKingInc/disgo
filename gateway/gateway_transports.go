@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/disgoorg/json/v2"
 	"github.com/gorilla/websocket"
@@ -146,10 +149,40 @@ func (r *pipeBuffer) Reset() {
 	r.buffer.Reset()
 }
 
+type streamTransportLifecycle struct {
+	receiveMu sync.Mutex
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (l *streamTransportLifecycle) receive(receive func() (*Message, error)) (*Message, error) {
+	l.receiveMu.Lock()
+	defer l.receiveMu.Unlock()
+	if l.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	return receive()
+}
+
+func (l *streamTransportLifecycle) close(conn *websocket.Conn, cleanup func()) error {
+	l.closeOnce.Do(func() {
+		l.closed.Store(true)
+		// Close the socket before waiting so a receive blocked in ReadMessage is
+		// released. Decoder and buffer cleanup must wait until that receive exits.
+		l.closeErr = conn.Close()
+		l.receiveMu.Lock()
+		defer l.receiveMu.Unlock()
+		cleanup()
+	})
+	return l.closeErr
+}
+
 // zstdStreamTransport implements zstd-stream compression.
 // See https://discord.com/developers/docs/events/gateway#zstdstream
 type zstdStreamTransport struct {
 	baseTransport
+	streamTransportLifecycle
 
 	inflator *zstd.Decoder
 	buffer   *pipeBuffer
@@ -166,6 +199,10 @@ func newZstdStreamTransport(conn *websocket.Conn, logger *slog.Logger) *zstdStre
 }
 
 func (t *zstdStreamTransport) ReceiveMessage() (*Message, error) {
+	return t.receive(t.receiveMessage)
+}
+
+func (t *zstdStreamTransport) receiveMessage() (*Message, error) {
 	mt, data, err := t.conn.ReadMessage()
 	if err != nil {
 		return nil, err
@@ -189,18 +226,20 @@ func (t *zstdStreamTransport) ReceiveMessage() (*Message, error) {
 }
 
 func (t *zstdStreamTransport) Close() error {
-	connClose := t.conn.Close()
-	t.buffer.Reset()
-	if t.inflator != nil {
-		t.inflator.Close()
-	}
-	return connClose
+	return t.close(t.conn, func() {
+		t.buffer.Reset()
+		if t.inflator != nil {
+			t.inflator.Close()
+			t.inflator = nil
+		}
+	})
 }
 
 // zlibStreamTransport implements zlib-stream compression.
 // See https://discord.com/developers/docs/events/gateway#zlibstream
 type zlibStreamTransport struct {
 	baseTransport
+	streamTransportLifecycle
 
 	inflator io.ReadCloser
 	buffer   *pipeBuffer
@@ -225,6 +264,10 @@ func isFrameEnd(data []byte) bool {
 }
 
 func (t *zlibStreamTransport) ReceiveMessage() (*Message, error) {
+	return t.receive(t.receiveMessage)
+}
+
+func (t *zlibStreamTransport) receiveMessage() (*Message, error) {
 	for {
 		mt, data, err := t.conn.ReadMessage()
 		if err != nil {
@@ -255,12 +298,13 @@ func (t *zlibStreamTransport) ReceiveMessage() (*Message, error) {
 }
 
 func (t *zlibStreamTransport) Close() error {
-	connClose := t.conn.Close()
-	t.buffer.Reset()
-	if t.inflator != nil {
-		_ = t.inflator.Close()
-	}
-	return connClose
+	return t.close(t.conn, func() {
+		t.buffer.Reset()
+		if t.inflator != nil {
+			_ = t.inflator.Close()
+			t.inflator = nil
+		}
+	})
 }
 
 // zlibPayloadTransport implements both no compression and payload zlib compression.
