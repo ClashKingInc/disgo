@@ -86,6 +86,9 @@ type chunkingRequest struct {
 
 	memberChan       chan<- discord.Member
 	memberFilterFunc func(member discord.Member) bool
+	done             chan struct{}
+	doneOnce         sync.Once
+	closed           bool
 
 	chunks int
 }
@@ -114,6 +117,9 @@ func (m *memberChunkingManagerImpl) HandleChunk(payload gateway.EventGuildMember
 
 	request.Lock()
 	defer request.Unlock()
+	if request.closed {
+		return
+	}
 
 	for _, member := range payload.Members {
 		// try to cache member
@@ -121,22 +127,44 @@ func (m *memberChunkingManagerImpl) HandleChunk(payload gateway.EventGuildMember
 		if request.memberFilterFunc != nil && !request.memberFilterFunc(member) {
 			continue
 		}
-		request.memberChan <- member
+		select {
+		case request.memberChan <- member:
+		case <-request.done:
+			return
+		}
 	}
 
 	// all chunks sent cleanup
 	if request.chunks == payload.ChunkCount-1 {
-		cleanupRequest(m, request)
+		cleanupRequestLocked(m, request)
 		return
 	}
 	request.chunks++
 }
 
 func cleanupRequest(m *memberChunkingManagerImpl, request *chunkingRequest) {
-	close(request.memberChan)
+	request.signalDone()
+	request.Lock()
+	defer request.Unlock()
+	cleanupRequestLocked(m, request)
+}
+
+func cleanupRequestLocked(m *memberChunkingManagerImpl, request *chunkingRequest) {
+	if request.closed {
+		return
+	}
+	request.closed = true
+	request.signalDone()
 	m.chunkingRequestsMu.Lock()
-	delete(m.chunkingRequests, request.nonce)
+	if m.chunkingRequests[request.nonce] == request {
+		delete(m.chunkingRequests, request.nonce)
+	}
 	m.chunkingRequestsMu.Unlock()
+	close(request.memberChan)
+}
+
+func (r *chunkingRequest) signalDone() {
+	r.doneOnce.Do(func() { close(r.done) })
 }
 
 func (m *memberChunkingManagerImpl) requestGuildMembersChan(ctx context.Context, guildID snowflake.ID, query *string, limit *int, userIDs []snowflake.ID, memberFilterFunc func(member discord.Member) bool) (<-chan discord.Member, func(), error) {
@@ -164,6 +192,7 @@ func (m *memberChunkingManagerImpl) requestGuildMembersChan(ctx context.Context,
 		nonce:            nonce,
 		memberChan:       memberChan,
 		memberFilterFunc: memberFilterFunc,
+		done:             make(chan struct{}),
 	}
 
 	m.chunkingRequestsMu.Lock()
