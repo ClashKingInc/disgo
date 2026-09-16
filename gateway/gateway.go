@@ -171,11 +171,22 @@ type gatewayImpl struct {
 	eventHandlerFunc EventHandlerFunc
 	token            string
 
-	conn            transport
-	connMu          sync.Mutex
+	conn   transport
+	connMu sync.Mutex
+
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	reconnecting    bool
+
+	sessionMu sync.RWMutex
+
+	heartbeatMu     sync.Mutex
 	heartbeatCancel context.CancelFunc
-	status          Status
-	statusMu        sync.Mutex
+	heartbeatEpoch  uint64
+
+	status   Status
+	statusMu sync.Mutex
 
 	heartbeatInterval     time.Duration
 	lastHeartbeatSent     time.Time
@@ -191,15 +202,33 @@ func (g *gatewayImpl) ShardCount() int {
 }
 
 func (g *gatewayImpl) SessionID() *string {
-	return g.config.SessionID
+	g.sessionMu.RLock()
+	defer g.sessionMu.RUnlock()
+	if g.config.SessionID == nil {
+		return nil
+	}
+	sessionID := *g.config.SessionID
+	return &sessionID
 }
 
 func (g *gatewayImpl) LastSequenceReceived() *int {
-	return g.config.LastSequenceReceived
+	g.sessionMu.RLock()
+	defer g.sessionMu.RUnlock()
+	if g.config.LastSequenceReceived == nil {
+		return nil
+	}
+	sequence := *g.config.LastSequenceReceived
+	return &sequence
 }
 
 func (g *gatewayImpl) ResumeURL() *string {
-	return g.config.ResumeURL
+	g.sessionMu.RLock()
+	defer g.sessionMu.RUnlock()
+	if g.config.ResumeURL == nil {
+		return nil
+	}
+	resumeURL := *g.config.ResumeURL
+	return &resumeURL
 }
 
 func (g *gatewayImpl) Intents() Intents {
@@ -207,7 +236,14 @@ func (g *gatewayImpl) Intents() Intents {
 }
 
 func (g *gatewayImpl) Open(ctx context.Context) error {
-	return g.doReconnect(ctx)
+	g.lifecycleMu.Lock()
+	if g.lifecycleCancel != nil {
+		g.lifecycleCancel()
+	}
+	g.lifecycleCtx, g.lifecycleCancel = context.WithCancel(ctx)
+	lifecycleCtx := g.lifecycleCtx
+	g.lifecycleMu.Unlock()
+	return g.doReconnect(lifecycleCtx)
 }
 
 func (g *gatewayImpl) open(ctx context.Context) error {
@@ -222,7 +258,8 @@ func (g *gatewayImpl) open(ctx context.Context) error {
 	g.status = StatusConnecting
 	g.statusMu.Unlock()
 
-	if g.config.LastSequenceReceived == nil || g.config.SessionID == nil {
+	canResume, resumeURL := g.resumeTarget()
+	if !canResume {
 		if err := g.config.IdentifyRateLimiter.Wait(ctx, g.config.ShardID); err != nil {
 			g.config.Logger.ErrorContext(ctx, "failed to wait for identify rate limiter", slog.Any("err", err))
 			g.connMu.Unlock()
@@ -232,8 +269,8 @@ func (g *gatewayImpl) open(ctx context.Context) error {
 	}
 
 	wsURL := g.config.URL
-	if g.config.ResumeURL != nil && g.config.EnableResumeURL {
-		wsURL = *g.config.ResumeURL
+	if resumeURL != "" && g.config.EnableResumeURL {
+		wsURL = resumeURL
 	}
 
 	values := url.Values{}
@@ -246,7 +283,9 @@ func (g *gatewayImpl) open(ctx context.Context) error {
 
 	gatewayURL := wsURL + "?" + values.Encode()
 
+	g.heartbeatMu.Lock()
 	g.lastHeartbeatSent = time.Now()
+	g.heartbeatMu.Unlock()
 	conn, rs, err := g.config.Dialer.DialContext(ctx, gatewayURL, nil)
 	if err != nil {
 		var body []byte
@@ -283,7 +322,7 @@ func (g *gatewayImpl) open(ctx context.Context) error {
 	g.statusMu.Unlock()
 
 	var readyOnce sync.Once
-	readyChan := make(chan error)
+	readyChan := make(chan error, 1)
 	go g.listen(t, func(err error) { // nolint:gosec
 		readyOnce.Do(func() {
 			readyChan <- err
@@ -295,28 +334,39 @@ func (g *gatewayImpl) open(ctx context.Context) error {
 	case <-ctx.Done():
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		g.Close(closeCtx)
+		g.CloseWithCode(closeCtx, websocket.CloseServiceRestart, "gateway open canceled")
 		return ctx.Err()
 	case err = <-readyChan:
 		if err != nil {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			g.Close(closeCtx)
+			g.CloseWithCode(closeCtx, websocket.CloseServiceRestart, "gateway open failed")
 			return fmt.Errorf("failed to open gateway connection: %w", err)
 		}
+	case <-time.After(g.config.ReadyTimeout):
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		g.CloseWithCode(closeCtx, websocket.CloseServiceRestart, "gateway readiness timeout")
+		cancel()
+		return fmt.Errorf("gateway did not reach READY or RESUMED within %s", g.config.ReadyTimeout)
 	}
 
 	return nil
 }
 
 func (g *gatewayImpl) Close(ctx context.Context) {
+	g.cancelLifecycle()
 	g.CloseWithCode(ctx, websocket.CloseNormalClosure, "Shutting down")
 }
 
 func (g *gatewayImpl) CloseWithCode(ctx context.Context, code int, message string) {
-	if g.heartbeatCancel != nil {
+	g.heartbeatMu.Lock()
+	heartbeatCancel := g.heartbeatCancel
+	g.heartbeatCancel = nil
+	g.heartbeatEpoch++
+	g.heartbeatMu.Unlock()
+	if heartbeatCancel != nil {
 		g.config.Logger.DebugContext(ctx, "closing heartbeat goroutine")
-		g.heartbeatCancel()
+		heartbeatCancel()
 	}
 
 	g.connMu.Lock()
@@ -332,9 +382,11 @@ func (g *gatewayImpl) CloseWithCode(ctx context.Context, code int, message strin
 
 		// clear resume data as we closed gracefully
 		if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
+			g.sessionMu.Lock()
 			g.config.SessionID = nil
 			g.config.ResumeURL = nil
 			g.config.LastSequenceReceived = nil
+			g.sessionMu.Unlock()
 		}
 	}
 	g.statusMu.Lock()
@@ -350,8 +402,9 @@ func (g *gatewayImpl) Status() Status {
 
 func (g *gatewayImpl) Send(ctx context.Context, op Opcode, d MessageData) error {
 	g.statusMu.Lock()
-	defer g.statusMu.Unlock()
-	if g.status != StatusReady {
+	ready := g.status == StatusReady
+	g.statusMu.Unlock()
+	if !ready {
 		return discord.ErrShardNotReady
 	}
 
@@ -379,6 +432,8 @@ func (g *gatewayImpl) sendInternal(ctx context.Context, commandType RateLimiterC
 }
 
 func (g *gatewayImpl) Latency() time.Duration {
+	g.heartbeatMu.Lock()
+	defer g.heartbeatMu.Unlock()
 	return g.lastHeartbeatReceived.Sub(g.lastHeartbeatSent)
 }
 
@@ -387,23 +442,25 @@ func (g *gatewayImpl) Presence() *MessageDataPresenceUpdate {
 }
 
 func (g *gatewayImpl) doReconnect(ctx context.Context) error {
-	var (
-		try              int
-		backoffIncrement int
-	)
+	if !g.beginReconnect() {
+		return discord.ErrGatewayAlreadyConnected
+	}
+	defer g.finishReconnect()
+	return g.reconnectLoop(ctx)
+}
+
+func (g *gatewayImpl) reconnectLoop(ctx context.Context) error {
+	try := 0
 
 	for {
-		// Exponentially backoff up to a limit of 10s
-		delay := time.Duration(1<<backoffIncrement) * time.Second
-		if delay > maximumConnectDelay {
-			delay = maximumConnectDelay
-		} else {
-			backoffIncrement++
-		}
+		delay := g.config.ReconnectDelay(try)
 
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return ctx.Err()
 		case <-timer.C:
 		}
@@ -434,39 +491,104 @@ func (g *gatewayImpl) doReconnect(ctx context.Context) error {
 	}
 }
 
-func (g *gatewayImpl) reconnect() {
-	if err := g.doReconnect(context.Background()); err != nil {
-		g.config.Logger.Error("failed to reopen gateway", slog.Any("err", err))
-
-		if g.config.CloseHandler != nil {
-			g.config.CloseHandler(g, err, false)
-		}
+func (g *gatewayImpl) requestReconnect() {
+	if !g.beginReconnect() {
+		return
 	}
+	g.lifecycleMu.Lock()
+	ctx := g.lifecycleCtx
+	g.lifecycleMu.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		g.finishReconnect()
+		return
+	}
+	go func() {
+		defer g.finishReconnect()
+		if err := g.reconnectLoop(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			g.config.Logger.Error("failed to reopen gateway", slog.Any("err", err))
+
+			if g.config.CloseHandler != nil {
+				g.config.CloseHandler(g, err, false)
+			}
+		}
+	}()
 }
 
-func (g *gatewayImpl) heartbeat() {
+func (g *gatewayImpl) beginReconnect() bool {
+	g.lifecycleMu.Lock()
+	defer g.lifecycleMu.Unlock()
+	if g.reconnecting {
+		return false
+	}
+	g.reconnecting = true
+	return true
+}
+
+func (g *gatewayImpl) finishReconnect() {
+	g.lifecycleMu.Lock()
+	g.reconnecting = false
+	g.lifecycleMu.Unlock()
+}
+
+func (g *gatewayImpl) cancelLifecycle() {
+	g.lifecycleMu.Lock()
+	if g.lifecycleCancel != nil {
+		g.lifecycleCancel()
+		g.lifecycleCancel = nil
+	}
+	g.lifecycleMu.Unlock()
+}
+
+func (g *gatewayImpl) resumeTarget() (bool, string) {
+	g.sessionMu.RLock()
+	defer g.sessionMu.RUnlock()
+	if g.config.LastSequenceReceived == nil || g.config.SessionID == nil {
+		return false, ""
+	}
+	if g.config.ResumeURL == nil {
+		return true, ""
+	}
+	return true, *g.config.ResumeURL
+}
+
+func (g *gatewayImpl) heartbeat(interval time.Duration) {
 	defer g.config.Logger.Debug("exiting heartbeat goroutine")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	g.heartbeatMu.Lock()
+	g.heartbeatEpoch++
+	epoch := g.heartbeatEpoch
 	g.heartbeatCancel = cancel
-
 	g.lastHeartbeatReceived = time.Now()
+	g.heartbeatMu.Unlock()
+
+	defer func() {
+		g.heartbeatMu.Lock()
+		if g.heartbeatEpoch == epoch {
+			g.heartbeatCancel = nil
+		}
+		g.heartbeatMu.Unlock()
+	}()
 
 	// Send heartbeats periodically every `heartbeat_interval`
-	heartbeatTicker := time.NewTicker(g.heartbeatInterval)
+	heartbeatTicker := time.NewTicker(interval)
+	defer heartbeatTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
 		case <-heartbeatTicker.C:
-			if g.lastHeartbeatSent.After(g.lastHeartbeatReceived) {
-				lastHeartbeatAgo := time.Since(g.lastHeartbeatReceived)
+			g.heartbeatMu.Lock()
+			missed := g.lastHeartbeatSent.After(g.lastHeartbeatReceived)
+			lastHeartbeatAgo := time.Since(g.lastHeartbeatReceived)
+			g.heartbeatMu.Unlock()
+			if missed {
 				g.config.Logger.Warn("ACK of last heartbeat not received, connection went zombie", slog.Duration("last_heartbeat_ago", lastHeartbeatAgo))
 				closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				g.CloseWithCode(closeCtx, websocket.CloseServiceRestart, "heartbeat ACK not received")
 				closeCancel()
-				go g.reconnect()
+				g.requestReconnect()
 				return
 			}
 
@@ -479,11 +601,16 @@ func (g *gatewayImpl) sendHeartbeat() {
 	g.config.Logger.Debug("sending heartbeat")
 
 	sequence := 0
+	g.sessionMu.RLock()
 	if g.config.LastSequenceReceived != nil {
 		sequence = *g.config.LastSequenceReceived
 	}
+	g.sessionMu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), g.heartbeatInterval)
+	g.heartbeatMu.Lock()
+	interval := g.heartbeatInterval
+	g.heartbeatMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), interval)
 	defer cancel()
 	if err := g.sendInternal(ctx, InternalCommandType, OpcodeHeartbeat, MessageDataHeartbeat(sequence)); err != nil {
 		if errors.Is(err, discord.ErrShardNotConnected) || errors.Is(err, syscall.EPIPE) {
@@ -493,10 +620,12 @@ func (g *gatewayImpl) sendHeartbeat() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
 		g.CloseWithCode(closeCtx, websocket.CloseServiceRestart, "heartbeat timeout")
-		go g.reconnect()
+		g.requestReconnect()
 		return
 	}
+	g.heartbeatMu.Lock()
 	g.lastHeartbeatSent = time.Now()
+	g.heartbeatMu.Unlock()
 }
 
 func (g *gatewayImpl) identify() error {
@@ -532,6 +661,11 @@ func (g *gatewayImpl) identify() error {
 }
 
 func (g *gatewayImpl) resume() error {
+	g.sessionMu.RLock()
+	if g.config.SessionID == nil || g.config.LastSequenceReceived == nil {
+		g.sessionMu.RUnlock()
+		return errors.New("resume requested without session state")
+	}
 	g.statusMu.Lock()
 	g.status = StatusResuming
 	g.statusMu.Unlock()
@@ -540,6 +674,7 @@ func (g *gatewayImpl) resume() error {
 		SessionID: *g.config.SessionID,
 		Seq:       *g.config.LastSequenceReceived,
 	}
+	g.sessionMu.RUnlock()
 	g.config.Logger.Debug("sending Resume command")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -581,10 +716,12 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 				closeCode := CloseEventCodeByCode(closeError.Code)
 				reconnect = closeCode.Reconnect
 
-				if closeCode == CloseEventCodeInvalidSeq {
+				if closeCode == CloseEventCodeInvalidSeq || closeCode == CloseEventCodeSessionTimed {
+					g.sessionMu.Lock()
 					g.config.LastSequenceReceived = nil
 					g.config.SessionID = nil
 					g.config.ResumeURL = nil
+					g.sessionMu.Unlock()
 				}
 				msg := "gateway close received"
 				args := []any{
@@ -609,7 +746,7 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 			g.CloseWithCode(ctx, websocket.CloseServiceRestart, "reconnecting")
 			cancel()
 			if g.config.AutoReconnect && reconnect {
-				go g.reconnect()
+				g.requestReconnect()
 			} else if g.config.CloseHandler != nil {
 				go g.config.CloseHandler(g, err, reconnect)
 			}
@@ -623,10 +760,14 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 
 		switch message.Op {
 		case OpcodeHello:
-			g.heartbeatInterval = time.Duration(message.D.(MessageDataHello).HeartbeatInterval) * time.Millisecond
-			go g.heartbeat()
+			interval := time.Duration(message.D.(MessageDataHello).HeartbeatInterval) * time.Millisecond
+			g.heartbeatMu.Lock()
+			g.heartbeatInterval = interval
+			g.heartbeatMu.Unlock()
+			go g.heartbeat(interval)
 
-			if g.config.LastSequenceReceived == nil || g.config.SessionID == nil {
+			canResume, _ := g.resumeTarget()
+			if !canResume {
 				err = g.identify()
 			} else {
 				err = g.resume()
@@ -638,7 +779,9 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 
 		case OpcodeDispatch:
 			// set last sequence received
+			g.sessionMu.Lock()
 			g.config.LastSequenceReceived = &message.S
+			g.sessionMu.Unlock()
 
 			eventData, ok := message.D.(EventData)
 			if !ok && message.D != nil {
@@ -647,15 +790,17 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 			}
 
 			if readyEvent, ok := eventData.(EventReady); ok {
+				g.sessionMu.Lock()
 				g.config.SessionID = &readyEvent.SessionID
 				g.config.ResumeURL = &readyEvent.ResumeGatewayURL
-				g.config.Logger.Debug("successfully identified", slog.String("session_id", *g.config.SessionID))
+				g.sessionMu.Unlock()
+				g.config.Logger.Debug("successfully identified")
 				g.statusMu.Lock()
 				g.status = StatusReady
 				g.statusMu.Unlock()
 				ready(nil)
 			} else if _, ok = eventData.(EventResumed); ok {
-				g.config.Logger.Debug("successfully resumed", slog.String("session_id", *g.config.SessionID))
+				g.config.Logger.Debug("successfully resumed")
 				g.statusMu.Lock()
 				g.status = StatusReady
 				g.statusMu.Unlock()
@@ -694,7 +839,7 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			g.CloseWithCode(ctx, websocket.CloseServiceRestart, "received reconnect")
 			cancel()
-			go g.reconnect()
+			g.requestReconnect()
 			return
 
 		case OpcodeInvalidSession:
@@ -705,9 +850,11 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 				code = websocket.CloseServiceRestart
 			} else {
 				// clear resume info
+				g.sessionMu.Lock()
 				g.config.SessionID = nil
 				g.config.LastSequenceReceived = nil
 				g.config.ResumeURL = nil
+				g.sessionMu.Unlock()
 			}
 
 			g.config.Logger.Warn("received invalid session", slog.Bool("can_resume", bool(canResume)))
@@ -723,14 +870,17 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			g.CloseWithCode(ctx, code, "invalid session")
 			cancel()
-			go g.reconnect()
+			g.requestReconnect()
 			return
 
 		case OpcodeHeartbeatACK:
 			newHeartbeat := time.Now()
+			g.heartbeatMu.Lock()
+			lastHeartbeat := g.lastHeartbeatReceived
 			g.lastHeartbeatReceived = newHeartbeat
+			g.heartbeatMu.Unlock()
 			g.eventHandlerFunc(g, EventTypeHeartbeatAck, message.S, EventHeartbeatAck{
-				LastHeartbeat: g.lastHeartbeatReceived,
+				LastHeartbeat: lastHeartbeat,
 				NewHeartbeat:  newHeartbeat,
 			})
 

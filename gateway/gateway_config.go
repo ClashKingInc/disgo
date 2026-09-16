@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"log/slog"
+	"math/rand/v2"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,6 +21,8 @@ func defaultConfig() config {
 		AutoReconnect:       true,
 		EnableResumeURL:     true,
 		IdentifyRateLimiter: NewNoopIdentifyRateLimiter(),
+		ReconnectDelay:      defaultReconnectDelay,
+		ReadyTimeout:        time.Minute,
 	}
 }
 
@@ -52,6 +56,10 @@ type config struct {
 	EnableRawEvents bool
 	// EnableResumeURL is whether the Gateway should enable the resumeURL. Defaults to true.
 	EnableResumeURL bool
+	// ReconnectDelay returns the bounded delay before a reconnect attempt.
+	ReconnectDelay func(retry int) time.Duration
+	// ReadyTimeout bounds a connected shard waiting for READY or RESUMED.
+	ReadyTimeout time.Duration
 	// RateLimiter is the RateLimiter of the Gateway. Defaults to NewRateLimiter().
 	RateLimiter RateLimiter
 	// RateLimiterConfigOpts is the RateLimiterConfigOpts of the Gateway. Defaults to nil.
@@ -178,6 +186,27 @@ func WithAutoReconnect(autoReconnect bool) ConfigOpt {
 	}
 }
 
+// WithReconnectDelay overrides the delay before each reconnect attempt. It is
+// primarily useful for deterministic tests; production should retain the
+// bounded exponential delay with jitter.
+func WithReconnectDelay(delay func(retry int) time.Duration) ConfigOpt {
+	return func(config *config) {
+		if delay != nil {
+			config.ReconnectDelay = delay
+		}
+	}
+}
+
+// WithReadyTimeout sets how long a connected shard may wait for READY or
+// RESUMED before it is treated as stalled and reconnected independently.
+func WithReadyTimeout(timeout time.Duration) ConfigOpt {
+	return func(config *config) {
+		if timeout > 0 {
+			config.ReadyTimeout = timeout
+		}
+	}
+}
+
 // WithEnableRawEvents enables/disables the EventTypeRaw.
 func WithEnableRawEvents(enableRawEventEvents bool) ConfigOpt {
 	return func(config *config) {
@@ -190,6 +219,21 @@ func WithEnableResumeURL(enableResumeURL bool) ConfigOpt {
 	return func(config *config) {
 		config.EnableResumeURL = enableResumeURL
 	}
+}
+
+func defaultReconnectDelay(retry int) time.Duration {
+	if retry < 0 {
+		retry = 0
+	}
+	if retry > 6 {
+		retry = 6
+	}
+	ceiling := time.Duration(1<<retry) * time.Second
+	if ceiling > maximumConnectDelay {
+		ceiling = maximumConnectDelay
+	}
+	floor := ceiling / 2
+	return floor + time.Duration(rand.Int64N(int64(ceiling-floor)+1))
 }
 
 // WithRateLimiter sets the grate.RateLimiter for the Gateway.
