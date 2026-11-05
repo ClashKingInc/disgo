@@ -97,7 +97,7 @@ func (s *guildImpl) CreateGuildChannel(guildID snowflake.ID, guildChannelCreate 
 	var ch discord.UnmarshalChannel
 	err = s.client.Do(CreateGuildChannel.Compile(nil, guildID), guildChannelCreate, &ch, opts...)
 	if err == nil {
-		guildChannel = ch.Channel.(discord.GuildChannel)
+		guildChannel, err = discord.ResolveGuildChannel(ch.Channel, guildID)
 	}
 	return
 }
@@ -108,7 +108,10 @@ func (s *guildImpl) GetGuildChannels(guildID snowflake.ID, opts ...RequestOpt) (
 	if err == nil {
 		channels = make([]discord.GuildChannel, len(chs))
 		for i := range chs {
-			channels[i] = chs[i].Channel.(discord.GuildChannel)
+			channels[i], err = discord.ResolveGuildChannel(chs[i].Channel, guildID)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return
