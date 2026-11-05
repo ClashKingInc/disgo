@@ -249,7 +249,11 @@ func (g *GatewayGuild) UnmarshalJSON(data []byte) error {
 
 	g.Channels = make([]GuildChannel, len(v.Channels))
 	for i := range v.Channels {
-		g.Channels[i] = v.Channels[i].Channel.(GuildChannel)
+		channel, err := ResolveGuildChannel(v.Channels[i].Channel, g.ID)
+		if err != nil {
+			return err
+		}
+		g.Channels[i] = channel
 	}
 
 	return nil

@@ -222,7 +222,12 @@ func (u *UnmarshalChannel) UnmarshalJSON(data []byte) error {
 		channel = v
 
 	default:
-		err = fmt.Errorf("unknown channel with type %d received", cType.Type)
+		var v UnknownChannel
+		err = json.Unmarshal(data, &v)
+		channel = v
+		if v.guildID != 0 {
+			channel = UnknownGuildChannel{v}
+		}
 	}
 
 	if err != nil {

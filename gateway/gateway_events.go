@@ -132,7 +132,11 @@ func (e *EventChannelCreate) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}
-	e.GuildChannel = v.Channel.(discord.GuildChannel)
+	channel, err := discord.ResolveGuildChannel(v.Channel, 0)
+	if err != nil {
+		return err
+	}
+	e.GuildChannel = channel
 	return nil
 }
 
@@ -148,7 +152,11 @@ func (e *EventChannelUpdate) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}
-	e.GuildChannel = v.Channel.(discord.GuildChannel)
+	channel, err := discord.ResolveGuildChannel(v.Channel, 0)
+	if err != nil {
+		return err
+	}
+	e.GuildChannel = channel
 	return nil
 }
 
@@ -164,7 +172,11 @@ func (e *EventChannelDelete) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}
-	e.GuildChannel = v.Channel.(discord.GuildChannel)
+	channel, err := discord.ResolveGuildChannel(v.Channel, 0)
+	if err != nil {
+		return err
+	}
+	e.GuildChannel = channel
 	return nil
 }
 
